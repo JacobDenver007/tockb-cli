@@ -16,7 +16,9 @@ use int_enum::IntEnum;
 use molecule::prelude::Byte;
 use serde::{Deserialize, Serialize};
 use tockb_types::{
-    config::{CKB_UNITS, PLEDGE, SIGNER_FEE_RATE, UDT_LEN, XT_CELL_CAPACITY},
+    config::{
+        CKB_UNITS, PLEDGE, SIGNER_FEE_RATE, SINCE_WITHDRAW_PLEDGE, UDT_LEN, XT_CELL_CAPACITY,
+    },
     generated::{
         basic,
         btc_difficulty::BTCDifficulty,
@@ -204,6 +206,12 @@ impl<'a> ToCkbSubCommand<'a> {
                     .arg(Arg::from("--redeemer-lockscript-addr=[redeemer-lockscript-addr] 'redeemer-lockscript-addr'").required(true))
                     .arg(Arg::from("--cell-path=[cell-path] 'cell-path'").default_value("./.ckb_cell.toml"))
                     .arg(Arg::from("-c --cell=[cell] 'cell'")),
+                App::new("withdraw_pledge")
+                    .about("withdraw pledge")
+                    .arg(arg::privkey_path().required(true))
+                    .arg(arg::tx_fee().required(true))
+                    .arg(Arg::from("--cell-path=[cell-path] 'cell-path'").default_value("./.ckb_cell.toml"))
+                    .arg(Arg::from("-c --cell=[cell] 'cell'"))
             ])
     }
 
@@ -573,7 +581,7 @@ impl<'a> ToCkbSubCommand<'a> {
 
         let mut helper = TxHelper::default();
 
-        let (ckb_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, true)?;
+        let (ckb_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, None, true)?;
         let input_capacity: u64 = ckb_cell.capacity().unpack();
 
         let type_script = ckb_cell
@@ -664,7 +672,7 @@ impl<'a> ToCkbSubCommand<'a> {
         self.add_cell_deps(&mut helper, outpoints)?;
 
         // get input tockb cell and basic info
-        let (from_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, true)?;
+        let (from_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, None, true)?;
         let from_ckb_cell_data = ToCKBCellData::from_slice(ckb_cell_data.as_ref()).unwrap();
 
         let (tockb_typescript, kind) = match from_cell.type_().to_opt() {
@@ -823,7 +831,7 @@ impl<'a> ToCkbSubCommand<'a> {
         }
 
         // get input tockb cell and basic info
-        let (from_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, true)?;
+        let (from_cell, ckb_cell_data) = self.get_ckb_cell(&mut helper, cell, None, true)?;
         let (tockb_typescript, kind) = match from_cell.type_().to_opt() {
             Some(script) => (script.clone(), script.args().raw_data().as_ref()[0]),
             None => return Err("typescript of tockb cell is none".to_owned()),
@@ -950,7 +958,7 @@ impl<'a> ToCkbSubCommand<'a> {
         let tx_fee: u64 = CapacityParser.parse(&tx_fee)?.into();
         let mut helper = TxHelper::default();
 
-        let (ckb_cell, _) = self.get_ckb_cell(&mut helper, cell, true)?;
+        let (ckb_cell, _) = self.get_ckb_cell(&mut helper, cell, None, true)?;
         let input_capacity: u64 = ckb_cell.capacity().unpack();
         let to_capacity = input_capacity;
 
@@ -978,6 +986,51 @@ impl<'a> ToCkbSubCommand<'a> {
                 .set_witnesses(vec![witness.as_bytes().pack()])
                 .build();
         }
+
+        let to_output = CellOutput::new_builder()
+            .capacity(Capacity::shannons(to_capacity).pack())
+            .lock((&from_address_payload).into())
+            .build();
+        helper.add_output(to_output, Bytes::new());
+        let tx = self.supply_capacity(&mut helper, tx_fee, privkey_path, skip_check)?;
+        let tx_hash = self
+            .rpc_client
+            .send_transaction(tx.data())
+            .map_err(|err| format!("Send transaction error: {}", err))?;
+        assert_eq!(tx.hash(), tx_hash.pack());
+        self.wait_for_commited(tx_hash.clone(), TIMEOUT)?;
+
+        ToCkbSubCommand::write_ckb_cell_config(cell_path, tx_hash.to_string(), 0)?;
+        Ok(tx)
+    }
+
+    pub fn withdraw_pledge(
+        &mut self,
+        args: WithdrawPledgeArgs,
+        skip_check: bool,
+        settings: Settings,
+    ) -> Result<TransactionView, String> {
+        let WithdrawPledgeArgs {
+            privkey_path,
+            tx_fee,
+            cell_path,
+            cell,
+        } = args;
+
+        let cell = ToCkbSubCommand::read_ckb_cell_config(cell_path.clone())
+            .or(cell.ok_or("cell is none".to_string()))?;
+        let from_privkey = PrivkeyPathParser.parse(&privkey_path)?;
+        let from_pubkey = secp256k1::PublicKey::from_secret_key(&SECP256K1, &from_privkey);
+        let from_address_payload = AddressPayload::from_pubkey(&from_pubkey);
+
+        let tx_fee: u64 = CapacityParser.parse(&tx_fee)?.into();
+        let mut helper = TxHelper::default();
+
+        self.get_ckb_cell(&mut helper, cell, Some(SINCE_WITHDRAW_PLEDGE), true)?;
+        let to_capacity = PLEDGE;
+
+        let outpoints = vec![settings.lockscript.outpoint, settings.typescript.outpoint];
+        self.add_cell_deps(&mut helper, outpoints)?;
 
         let to_output = CellOutput::new_builder()
             .capacity(Capacity::shannons(to_capacity).pack())
@@ -1126,6 +1179,7 @@ impl<'a> ToCkbSubCommand<'a> {
         &mut self,
         helper: &mut TxHelper,
         cell: String,
+        since: Option<u64>,
         add_to_input: bool,
     ) -> Result<(CellOutput, Bytes), String> {
         let parts: Vec<_> = cell.split('.').collect();
@@ -1146,7 +1200,7 @@ impl<'a> ToCkbSubCommand<'a> {
 
             helper.add_input(
                 original_tx_outpoint.clone(),
-                None,
+                since,
                 &mut get_live_cell_fn,
                 &genesis_info,
                 true,
@@ -1474,6 +1528,25 @@ impl<'a> CliSubCommand for ToCkbSubCommand<'a> {
                     Ok(Output::new_output(tx_hash))
                 }
             }
+            ("withdraw_pledge", Some(m)) => {
+                let settings = Settings::new(&config_path).map_err(|e| {
+                    format!("failed to load config from {}, err: {}", &config_path, e)
+                })?;
+                let args = WithdrawPledgeArgs {
+                    cell: m.value_of("cell").map(|s| s.to_string()),
+                    cell_path: get_arg_value(m, "cell-path").map(|s| s.to_string())?,
+                    privkey_path: get_arg_value(m, "privkey-path").map(|s| s.to_string())?,
+                    tx_fee: get_arg_value(m, "tx-fee")?,
+                };
+                let tx = self.withdraw_pledge(args, true, settings)?;
+                if debug {
+                    let rpc_tx_view = json_types::TransactionView::from(tx);
+                    Ok(Output::new_output(rpc_tx_view))
+                } else {
+                    let tx_hash: H256 = tx.hash().unpack();
+                    Ok(Output::new_output(tx_hash))
+                }
+            }
             _ => Err(Self::subcommand().generate_usage()),
         }
     }
@@ -1577,6 +1650,15 @@ pub struct PreTermRedeemArgs {
 
     pub x_unlock_address: String,
     pub redeemer_lockscript_addr: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct WithdrawPledgeArgs {
+    pub privkey_path: String,
+    pub tx_fee: String,
+
+    pub cell_path: String,
+    pub cell: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
