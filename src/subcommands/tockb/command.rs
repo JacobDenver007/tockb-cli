@@ -17,7 +17,8 @@ use molecule::prelude::Byte;
 use serde::{Deserialize, Serialize};
 use tockb_types::{
     config::{
-        CKB_UNITS, PLEDGE, SIGNER_FEE_RATE, SINCE_WITHDRAW_PLEDGE, UDT_LEN, XT_CELL_CAPACITY,
+        CKB_UNITS, PLEDGE, SIGNER_FEE_RATE, SINCE_WITHDRAW_PLEDGE,
+        SINCE_WITHDRAW_PLEDGE_COLLATERAL, UDT_LEN, XT_CELL_CAPACITY,
     },
     generated::{
         basic,
@@ -211,7 +212,13 @@ impl<'a> ToCkbSubCommand<'a> {
                     .arg(arg::privkey_path().required(true))
                     .arg(arg::tx_fee().required(true))
                     .arg(Arg::from("--cell-path=[cell-path] 'cell-path'").default_value("./.ckb_cell.toml"))
-                    .arg(Arg::from("-c --cell=[cell] 'cell'"))
+                    .arg(Arg::from("-c --cell=[cell] 'cell'")),
+                App::new("withdraw_pledge_collateral")
+                    .about("withdraw pledge and collateral")
+                    .arg(arg::privkey_path().required(true))
+                    .arg(arg::tx_fee().required(true))
+                    .arg(Arg::from("--cell-path=[cell-path] 'cell-path'").default_value("./.ckb_cell.toml"))
+                    .arg(Arg::from("-c --cell=[cell] 'cell'")),
             ])
     }
 
@@ -1049,6 +1056,56 @@ impl<'a> ToCkbSubCommand<'a> {
         Ok(tx)
     }
 
+    pub fn withdraw_pledge_collateral(
+        &mut self,
+        args: WithdrawPledgeCollateralArgs,
+        skip_check: bool,
+        settings: Settings,
+    ) -> Result<TransactionView, String> {
+        let WithdrawPledgeCollateralArgs {
+            privkey_path,
+            tx_fee,
+            cell_path,
+            cell,
+        } = args;
+
+        let cell = ToCkbSubCommand::read_ckb_cell_config(cell_path.clone())
+            .or(cell.ok_or("cell is none".to_string()))?;
+        let from_privkey = PrivkeyPathParser.parse(&privkey_path)?;
+        let from_pubkey = secp256k1::PublicKey::from_secret_key(&SECP256K1, &from_privkey);
+        let from_address_payload = AddressPayload::from_pubkey(&from_pubkey);
+
+        let tx_fee: u64 = CapacityParser.parse(&tx_fee)?.into();
+        let mut helper = TxHelper::default();
+
+        let (ckb_cell, _) = self.get_ckb_cell(
+            &mut helper,
+            cell,
+            Some(SINCE_WITHDRAW_PLEDGE_COLLATERAL),
+            true,
+        )?;
+        let to_capacity = ckb_cell.capacity().unpack();
+
+        let outpoints = vec![settings.lockscript.outpoint, settings.typescript.outpoint];
+        self.add_cell_deps(&mut helper, outpoints)?;
+
+        let to_output = CellOutput::new_builder()
+            .capacity(Capacity::shannons(to_capacity).pack())
+            .lock((&from_address_payload).into())
+            .build();
+        helper.add_output(to_output, Bytes::new());
+        let tx = self.supply_capacity(&mut helper, tx_fee, privkey_path, skip_check)?;
+        let tx_hash = self
+            .rpc_client
+            .send_transaction(tx.data())
+            .map_err(|err| format!("Send transaction error: {}", err))?;
+        assert_eq!(tx.hash(), tx_hash.pack());
+        self.wait_for_commited(tx_hash.clone(), TIMEOUT)?;
+
+        ToCkbSubCommand::write_ckb_cell_config(cell_path, tx_hash.to_string(), 0)?;
+        Ok(tx)
+    }
+
     fn supply_capacity(
         &mut self,
         helper: &mut TxHelper,
@@ -1547,6 +1604,25 @@ impl<'a> CliSubCommand for ToCkbSubCommand<'a> {
                     Ok(Output::new_output(tx_hash))
                 }
             }
+            ("withdraw_pledge_collateral", Some(m)) => {
+                let settings = Settings::new(&config_path).map_err(|e| {
+                    format!("failed to load config from {}, err: {}", &config_path, e)
+                })?;
+                let args = WithdrawPledgeCollateralArgs {
+                    cell: m.value_of("cell").map(|s| s.to_string()),
+                    cell_path: get_arg_value(m, "cell-path").map(|s| s.to_string())?,
+                    privkey_path: get_arg_value(m, "privkey-path").map(|s| s.to_string())?,
+                    tx_fee: get_arg_value(m, "tx-fee")?,
+                };
+                let tx = self.withdraw_pledge_collateral(args, true, settings)?;
+                if debug {
+                    let rpc_tx_view = json_types::TransactionView::from(tx);
+                    Ok(Output::new_output(rpc_tx_view))
+                } else {
+                    let tx_hash: H256 = tx.hash().unpack();
+                    Ok(Output::new_output(tx_hash))
+                }
+            }
             _ => Err(Self::subcommand().generate_usage()),
         }
     }
@@ -1654,6 +1730,15 @@ pub struct PreTermRedeemArgs {
 
 #[derive(Clone, Debug)]
 pub struct WithdrawPledgeArgs {
+    pub privkey_path: String,
+    pub tx_fee: String,
+
+    pub cell_path: String,
+    pub cell: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WithdrawPledgeCollateralArgs {
     pub privkey_path: String,
     pub tx_fee: String,
 
