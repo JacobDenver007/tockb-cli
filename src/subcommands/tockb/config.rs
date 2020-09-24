@@ -1,3 +1,4 @@
+use ckb_types::packed::Byte32;
 use config::{Config, ConfigError, Environment, File};
 use serde_derive::{Deserialize, Serialize};
 
@@ -55,11 +56,11 @@ impl Settings {
 }
 
 #[derive(Deserialize, Serialize, Default, Debug, Clone)]
-pub struct CKBCell {
-    pub outpoint: OutpointConf,
+pub struct TypeScriptHash {
+    pub typescript_hash: String,
 }
 
-impl CKBCell {
+impl TypeScriptHash {
     pub fn new(config_path: &str) -> Result<Self, ConfigError> {
         let mut s = Config::new();
         s.merge(File::with_name(config_path))?;
